@@ -114,7 +114,12 @@ fn read_pkg_payload(pkg: &PathBuf, keep_pyc: bool) -> Result<Payload> {
             continue;
         }
         let Some(rel) = raw.split_once("/site-packages/").map(|(_, r)| r.to_string()) else {
-            if entry.header().entry_type().is_file() {
+            // Docs/licenses/man pages never belong in a wheel; only report
+            // payload whose loss could matter (bin/ scripts, headers, ...).
+            let expected_loss = ["/share/doc/", "/share/licenses/", "/share/man/", "/share/examples/"]
+                .iter()
+                .any(|p| raw.contains(p));
+            if entry.header().entry_type().is_file() && !expected_loss {
                 skipped.push(raw);
             }
             continue;
