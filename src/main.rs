@@ -9,10 +9,10 @@
 //!
 //! Design + roadmap: bead mu-vwp5.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
@@ -44,6 +44,30 @@ enum Cmd {
         #[arg(long)]
         keep_pyc: bool,
     },
+    /// Populate a find-links directory with wheels for a package set,
+    /// following python dependencies through the pkgs' own manifests.
+    Materialize {
+        /// PyPI-style names (numpy, scikit-learn) or pkg names (py312-numpy).
+        packages: Vec<String>,
+        /// Find-links directory to populate.
+        #[arg(short, long, default_value = ".")]
+        outdir: PathBuf,
+        /// Python version used for the pkg name prefix (pyXY-).
+        #[arg(long, default_value = "3.12")]
+        python: String,
+        /// Directories searched for .pkg files (repeatable).
+        #[arg(long, default_value = "/var/cache/pkg")]
+        pkg_dir: Vec<PathBuf>,
+        /// Do not attempt `pkg fetch` for pkgs missing from the pkg dirs.
+        #[arg(long)]
+        no_fetch: bool,
+        /// Platform tag to stamp (default: computed for this machine).
+        #[arg(long)]
+        platform_tag: Option<String>,
+        /// Keep __pycache__/.pyc files (wheels normally omit them).
+        #[arg(long)]
+        keep_pyc: bool,
+    },
     /// Print the platform tag this machine expects in wheel filenames.
     PlatformTag,
 }
@@ -55,9 +79,19 @@ fn main() -> Result<()> {
                 Some(t) => t,
                 None => local_platform_tag()?,
             };
-            let out = convert(&pkg, &outdir, &tag, keep_pyc)?;
+            let (_, out) = convert(&pkg, &outdir, &tag, keep_pyc)?;
             println!("{}", out.display());
             Ok(())
+        }
+        Cmd::Materialize { packages, outdir, python, pkg_dir, no_fetch, platform_tag, keep_pyc } => {
+            if packages.is_empty() {
+                bail!("no packages requested");
+            }
+            let tag = match platform_tag {
+                Some(t) => t,
+                None => local_platform_tag()?,
+            };
+            materialize(&packages, &outdir, &python, &pkg_dir, no_fetch, &tag, keep_pyc)
         }
         Cmd::PlatformTag => {
             println!("{}", local_platform_tag()?);
@@ -81,6 +115,13 @@ fn local_platform_tag() -> Result<String> {
     Ok(format!("{s}-{r}-{m}").to_lowercase().replace(['.', '-'], "_"))
 }
 
+struct PkgInfo {
+    name: String,
+    version: String,
+    /// dependency pkg name -> version, from +COMPACT_MANIFEST
+    deps: BTreeMap<String, String>,
+}
+
 struct Payload {
     /// site-packages-relative path -> (mode, content)
     files: BTreeMap<String, (u32, Vec<u8>)>,
@@ -88,7 +129,7 @@ struct Payload {
     skipped: Vec<String>,
 }
 
-fn read_pkg_payload(pkg: &PathBuf, keep_pyc: bool) -> Result<Payload> {
+fn read_pkg(pkg: &Path, keep_pyc: bool) -> Result<(PkgInfo, Payload)> {
     let mut f = File::open(pkg).with_context(|| format!("open {}", pkg.display()))?;
     let mut magic = [0u8; 4];
     f.read_exact(&mut magic)?;
@@ -103,13 +144,38 @@ fn read_pkg_payload(pkg: &PathBuf, keep_pyc: bool) -> Result<Payload> {
     let dec = zstd::stream::read::Decoder::new(f)?;
     let mut ar = tar::Archive::new(dec);
 
+    let mut info: Option<PkgInfo> = None;
     let mut files: BTreeMap<String, (u32, Vec<u8>)> = BTreeMap::new();
     let mut skipped = Vec::new();
 
     for entry in ar.entries()? {
         let mut entry = entry?;
         let raw = String::from_utf8_lossy(&entry.path_bytes()).into_owned();
-        // pkg metadata files (+MANIFEST, +COMPACT_MANIFEST) are not payload.
+        if raw == "+COMPACT_MANIFEST" || raw == "+MANIFEST" {
+            if info.is_none() {
+                let mut buf = Vec::with_capacity(entry.size() as usize);
+                entry.read_to_end(&mut buf)?;
+                let m: serde_json::Value = serde_json::from_slice(&buf)
+                    .with_context(|| format!("parse {raw} in {}", pkg.display()))?;
+                let deps = m["deps"]
+                    .as_object()
+                    .map(|o| {
+                        o.iter()
+                            .map(|(k, v)| {
+                                (k.clone(), v["version"].as_str().unwrap_or("").to_string())
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                info = Some(PkgInfo {
+                    name: m["name"].as_str().unwrap_or("").to_string(),
+                    version: m["version"].as_str().unwrap_or("").to_string(),
+                    deps,
+                });
+            }
+            continue;
+        }
+        // other pkg metadata files are not payload
         if raw.starts_with('+') {
             continue;
         }
@@ -161,7 +227,8 @@ fn read_pkg_payload(pkg: &PathBuf, keep_pyc: bool) -> Result<Payload> {
             other => skipped.push(format!("{raw} ({other:?})")),
         }
     }
-    Ok(Payload { files, skipped })
+    let info = info.context("pkg has no +COMPACT_MANIFEST/+MANIFEST")?;
+    Ok((info, Payload { files, skipped }))
 }
 
 /// Rewrite WHEEL's Tag lines, replacing the platform component with ours.
@@ -204,8 +271,8 @@ fn restamp_wheel(content: &str, platform_tag: &str) -> Result<(String, String)> 
     Ok((out, fname_tag))
 }
 
-fn convert(pkg: &PathBuf, outdir: &PathBuf, platform_tag: &str, keep_pyc: bool) -> Result<PathBuf> {
-    let payload = read_pkg_payload(pkg, keep_pyc)?;
+fn convert(pkg: &Path, outdir: &Path, platform_tag: &str, keep_pyc: bool) -> Result<(PkgInfo, PathBuf)> {
+    let (info, payload) = read_pkg(pkg, keep_pyc)?;
     if payload.files.is_empty() {
         bail!("{}: no site-packages payload found; not a python pkg?", pkg.display());
     }
@@ -285,5 +352,125 @@ fn convert(pkg: &PathBuf, outdir: &PathBuf, platform_tag: &str, keep_pyc: bool) 
             eprintln!("  ... and {} more", payload.skipped.len() - 10);
         }
     }
-    Ok(out_path)
+    Ok((info, out_path))
+}
+
+/// Map a requested name to a pkg name: pass py3* names through, otherwise
+/// prefix with pyXY-. (Ports occasionally rename — pyyaml is py312-yaml —
+/// pass the pkg name directly for those.)
+fn resolve_pkg_name(requested: &str, pyprefix: &str) -> String {
+    if requested.starts_with("py3") {
+        requested.to_string()
+    } else {
+        format!("{pyprefix}-{}", requested.to_lowercase())
+    }
+}
+
+/// Find a .pkg file for `pkgname` in `dirs`: `{pkgname}-{version}.pkg` where
+/// version starts with a digit (so py312-pandas doesn't match
+/// py312-pandas-stubs). Prefers the lexically-greatest version and ignores
+/// the `~hash` duplicate names pkg writes.
+fn find_pkg_file(pkgname: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
+    let prefix = format!("{pkgname}-");
+    let mut best: Option<(String, PathBuf)> = None;
+    for dir in dirs {
+        let Ok(rd) = std::fs::read_dir(dir) else { continue };
+        for e in rd.flatten() {
+            let fname = e.file_name().to_string_lossy().into_owned();
+            let Some(rest) = fname.strip_prefix(&prefix) else { continue };
+            let Some(ver) = rest.strip_suffix(".pkg") else { continue };
+            if ver.contains('~') || !ver.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            if best.as_ref().is_none_or(|(b, _)| ver > b.as_str()) {
+                best = Some((ver.to_string(), e.path()));
+            }
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+fn materialize(
+    packages: &[String],
+    outdir: &Path,
+    python: &str,
+    pkg_dirs: &[PathBuf],
+    no_fetch: bool,
+    platform_tag: &str,
+    keep_pyc: bool,
+) -> Result<()> {
+    let pyprefix = format!("py{}", python.replace('.', ""));
+    let fetch_dir = dirs_cache_dir()?;
+    let mut search_dirs: Vec<PathBuf> = pkg_dirs.to_vec();
+    // pkg fetch -o writes into <dir>/All
+    search_dirs.push(fetch_dir.join("All"));
+
+    let mut queue: VecDeque<String> =
+        packages.iter().map(|p| resolve_pkg_name(p, &pyprefix)).collect();
+    let mut visited: BTreeSet<String> = BTreeSet::new();
+    let mut wheels: Vec<PathBuf> = Vec::new();
+    let mut native: BTreeMap<String, String> = BTreeMap::new();
+    let mut missing: Vec<String> = Vec::new();
+
+    while let Some(pkgname) = queue.pop_front() {
+        if !visited.insert(pkgname.clone()) {
+            continue;
+        }
+        let mut file = find_pkg_file(&pkgname, &search_dirs);
+        if file.is_none() && !no_fetch {
+            let st = Command::new("pkg")
+                .args(["fetch", "-y", "-o"])
+                .arg(&fetch_dir)
+                .arg(&pkgname)
+                .status();
+            if !st.map(|s| s.success()).unwrap_or(false) {
+                eprintln!(
+                    "note: `pkg fetch {pkgname}` failed (root/doas needed for the repo catalogue?)"
+                );
+            }
+            file = find_pkg_file(&pkgname, &search_dirs);
+        }
+        let Some(file) = file else {
+            missing.push(pkgname);
+            continue;
+        };
+        let (info, wheel) = convert(&file, outdir, platform_tag, keep_pyc)
+            .with_context(|| format!("convert {}", file.display()))?;
+        println!("{pkgname} -> {}", wheel.file_name().unwrap_or_default().to_string_lossy());
+        wheels.push(wheel);
+        for (dep, ver) in info.deps {
+            if dep.starts_with(&format!("{pyprefix}-")) {
+                queue.push_back(dep);
+            } else if !dep.starts_with("python3") {
+                native.entry(dep).or_insert(ver);
+            }
+        }
+    }
+
+    println!("\nmaterialized {} wheel(s) into {}", wheels.len(), outdir.display());
+    if !native.is_empty() {
+        println!("native pkg deps required at runtime (converted wheels link against /usr/local/lib):");
+        for (dep, ver) in &native {
+            let installed = Command::new("pkg")
+                .args(["info", "-e", dep])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            let mark = if installed { "installed" } else { "MISSING — pkg install" };
+            println!("  {dep} {ver} [{mark}]");
+        }
+    }
+    if !missing.is_empty() {
+        println!("no .pkg found for: {}", missing.join(", "));
+        println!("  (fetch with: doas pkg fetch -y {})", missing.join(" "));
+        bail!("{} pkg(s) could not be materialized", missing.len());
+    }
+    Ok(())
+}
+
+fn dirs_cache_dir() -> Result<PathBuf> {
+    let home = std::env::var("HOME").context("HOME not set")?;
+    let d = PathBuf::from(home).join(".cache/wheelfs/pkgs");
+    std::fs::create_dir_all(&d)?;
+    Ok(d)
 }

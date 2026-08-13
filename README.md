@@ -7,8 +7,14 @@ the ports tree has already solved every per-package build problem. wheelfs
 reunites the two instead of rebuilding anything.
 
 ```sh
+# one pkg file -> one wheel
 wheelfs convert /var/cache/pkg/py312-numpy-2.4.6_1,1.pkg -o ~/wheels
-uv pip install --no-index --find-links ~/wheels numpy
+
+# a package set -> a find-links dir, following python deps through the
+# pkgs' own manifests, reporting the native library pkgs they link against
+wheelfs materialize contourpy scikit-learn -o ~/wheels
+
+uv pip install --no-index --find-links ~/wheels contourpy
 ```
 
 Conversion is extraction + re-zip:
@@ -39,10 +45,13 @@ python/abi tags with the local platform tag.
 
 ## Roadmap (bead mu-vwp5)
 
-1. **convert** — `.pkg` → `.whl` (works, this repo).
-2. **materialize** — catalog-driven batch mode: populate a find-links dir
-   for a package set (e.g. from `uv export` of a lockfile), fetching via
-   `pkg fetch` (inherits mirrors, repo priority, signature verification).
+1. **convert** — `.pkg` → `.whl` (works).
+2. **materialize** — populate a find-links dir for a package set, walking
+   python deps via each pkg's `+COMPACT_MANIFEST` and reporting native
+   library deps with installed status (works; sources `.pkg` files from
+   `/var/cache/pkg` and `pkg fetch` — the fetch path needs root/doas for
+   the repo catalogue, or pre-fetched files). Name mapping is `pyXY-<name>`;
+   for ports that rename (pyyaml → `py312-yaml`) pass the pkg name directly.
 3. **mount** — FUSE filesystem: readdir synthesized from the pkg catalog,
    `open()` triggers fetch+convert, a backing dir is the cache. The
    spiritual revival of 4.4BSD `mount_portalfs`'s `rfilter`.
