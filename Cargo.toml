@@ -1,0 +1,15 @@
+[package]
+name = "wheelfs"
+version = "0.1.0"
+edition = "2021"
+description = "Convert FreeBSD python pkgs into wheels; eventually a FUSE find-links filesystem"
+license = "BSD-2-Clause"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+sha2 = "0.10"
+tar = "0.4"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+zstd = "0.13"
