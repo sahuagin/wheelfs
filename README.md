@@ -32,6 +32,33 @@ Conversion is extraction + re-zip:
 Pure packages come out `py3-none-any`; compiled ones keep their original
 python/abi tags with the local platform tag.
 
+## Using the wheelhouse with `uv sync`
+
+A project can resolve and sync entirely from a materialized directory:
+
+```toml
+[[tool.uv.index]]
+name = "wheelfs"
+url = "file:///home/you/wheels"
+format = "flat"
+default = true
+```
+
+Findings from a full dress rehearsal (uv 0.11, numpy/pandas/polars/pyarrow/
+scikit-learn/statsmodels/xgboost/lightgbm + their 56-pkg closure):
+
+- **Leave the lock universal.** `tool.uv.environments`/`required-environments`
+  marker forks fail: uv's lock-time tag→marker inference doesn't know
+  FreeBSD platform tags (install-time matching is fine — an upstream patch
+  opportunity). Universal resolution + sync works.
+- **Platform-exclusive deps need `exclude-dependencies`** when the
+  wheelhouse is the only index (e.g. xgboost's linux-only
+  `nvidia-nccl-cu12`).
+- **Install the reported native pkgs first.** The materialize report is
+  accurate: with `arrow`/`dmlc-core` absent, exactly pyarrow and xgboost
+  fail at import (and `polars.to_pandas()`, which routes through pyarrow) —
+  everything else trains, aggregates, and merges normally.
+
 ## Things to know
 
 - **Converted wheels link against `/usr/local/lib`.** Ports link shared
@@ -50,8 +77,11 @@ python/abi tags with the local platform tag.
    python deps via each pkg's `+COMPACT_MANIFEST` and reporting native
    library deps with installed status (works; sources `.pkg` files from
    `/var/cache/pkg` and `pkg fetch` — the fetch path needs root/doas for
-   the repo catalogue, or pre-fetched files). Name mapping is `pyXY-<name>`;
+   the repo catalogue, or pre-fetched files; unprivileged direct-mirror
+   fetch via the repo catalog is planned). Name mapping is `pyXY-<name>`;
    for ports that rename (pyyaml → `py312-yaml`) pass the pkg name directly.
+   Handles both PEP 517 dist-info pkgs and setuptools-era egg-info pkgs
+   (dist-info is synthesized), and both flat and hashed repo layouts.
 3. **mount** — FUSE filesystem: readdir synthesized from the pkg catalog,
    `open()` triggers fetch+convert, a backing dir is the cache. The
    spiritual revival of 4.4BSD `mount_portalfs`'s `rfilter`.

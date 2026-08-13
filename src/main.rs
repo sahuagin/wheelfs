@@ -127,6 +127,8 @@ struct Payload {
     files: BTreeMap<String, (u32, Vec<u8>)>,
     /// paths in the pkg payload that are not under site-packages
     skipped: Vec<String>,
+    /// python X.Y from the site-packages path prefix
+    pyver: Option<String>,
 }
 
 fn read_pkg(pkg: &Path, keep_pyc: bool) -> Result<(PkgInfo, Payload)> {
@@ -147,6 +149,7 @@ fn read_pkg(pkg: &Path, keep_pyc: bool) -> Result<(PkgInfo, Payload)> {
     let mut info: Option<PkgInfo> = None;
     let mut files: BTreeMap<String, (u32, Vec<u8>)> = BTreeMap::new();
     let mut skipped = Vec::new();
+    let mut pyver: Option<String> = None;
 
     for entry in ar.entries()? {
         let mut entry = entry?;
@@ -178,6 +181,15 @@ fn read_pkg(pkg: &Path, keep_pyc: bool) -> Result<(PkgInfo, Payload)> {
         // other pkg metadata files are not payload
         if raw.starts_with('+') {
             continue;
+        }
+        if pyver.is_none() {
+            if let Some((pre, _)) = raw.split_once("/site-packages/") {
+                pyver = pre
+                    .rsplit('/')
+                    .next()
+                    .and_then(|d| d.strip_prefix("python"))
+                    .map(|v| v.to_string());
+            }
         }
         let Some(rel) = raw.split_once("/site-packages/").map(|(_, r)| r.to_string()) else {
             // Docs/licenses/man pages never belong in a wheel; only report
@@ -228,7 +240,122 @@ fn read_pkg(pkg: &Path, keep_pyc: bool) -> Result<(PkgInfo, Payload)> {
         }
     }
     let info = info.context("pkg has no +COMPACT_MANIFEST/+MANIFEST")?;
-    Ok((info, Payload { files, skipped }))
+    Ok((info, Payload { files, skipped, pyver }))
+}
+
+/// Older ports install setuptools egg-info instead of PEP 517 dist-info.
+/// Synthesize dist-info in place: PKG-INFO -> METADATA, generated WHEEL,
+/// requires.txt -> Requires-Dist lines appended to METADATA.
+fn egg_info_to_dist_info(payload: &mut Payload) -> Result<()> {
+    let egg_dir = payload
+        .files
+        .keys()
+        .filter_map(|p| p.split_once('/').map(|(d, _)| d))
+        .find(|d| d.ends_with(".egg-info"))
+        .map(|d| d.to_string());
+    let Some(egg_dir) = egg_dir else {
+        bail!("no .dist-info or .egg-info directory in payload");
+    };
+
+    // "{name}-{version}[-pyX.Y].egg-info"
+    let mut stem = egg_dir.trim_end_matches(".egg-info").to_string();
+    if let Some((rest, tail)) = stem.rsplit_once('-') {
+        if tail.starts_with("py") && tail[2..].chars().all(|c| c.is_ascii_digit() || c == '.') {
+            stem = rest.to_string();
+        }
+    }
+    let (name, version) = stem
+        .rsplit_once('-')
+        .with_context(|| format!("cannot parse name-version from {egg_dir}"))?;
+    let distinfo = format!("{name}-{version}.dist-info");
+
+    let take = |payload: &mut Payload, f: &str| payload.files.remove(&format!("{egg_dir}/{f}"));
+    let pkg_info = take(payload, "PKG-INFO")
+        .with_context(|| format!("{egg_dir} has no PKG-INFO"))?;
+    let mut metadata = String::from_utf8_lossy(&pkg_info.1).into_owned();
+
+    // requires.txt: plain lines are deps; "[extra]" / "[extra:marker]"
+    // sections scope the lines that follow.
+    if let Some((_, req)) = take(payload, "requires.txt") {
+        let mut extra: Option<String> = None;
+        let mut marker: Option<String> = None;
+        let mut lines = String::new();
+        for line in String::from_utf8_lossy(&req).lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(section) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+                let (e, m) = section.split_once(':').unwrap_or((section, ""));
+                extra = (!e.is_empty()).then(|| e.to_string());
+                marker = (!m.is_empty()).then(|| m.to_string());
+                if let Some(e) = &extra {
+                    lines.push_str(&format!("Provides-Extra: {e}\n"));
+                }
+                continue;
+            }
+            let mut conds = Vec::new();
+            if let Some(m) = &marker {
+                conds.push(m.clone());
+            }
+            if let Some(e) = &extra {
+                conds.push(format!("extra == '{e}'"));
+            }
+            if conds.is_empty() {
+                lines.push_str(&format!("Requires-Dist: {line}\n"));
+            } else {
+                lines.push_str(&format!("Requires-Dist: {line} ; {}\n", conds.join(" and ")));
+            }
+        }
+        // Metadata headers end at the first blank line (the description
+        // body follows); insert the dependency fields before it.
+        match metadata.find("\n\n") {
+            Some(i) => metadata.insert_str(i + 1, &lines),
+            None => {
+                if !metadata.ends_with('\n') {
+                    metadata.push('\n');
+                }
+                metadata.push_str(&lines);
+            }
+        }
+    }
+
+    // Compiled if any extension module is present; tag conservatively for
+    // this interpreter (restamp replaces the placeholder platform).
+    let compiled = payload.files.keys().any(|p| p.ends_with(".so"));
+    let tag = if compiled {
+        let cp = payload
+            .pyver
+            .as_deref()
+            .map(|v| format!("cp{}", v.replace('.', "")))
+            .context("compiled egg-info pkg but python version unknown")?;
+        format!("{cp}-{cp}-freebsd")
+    } else {
+        "py3-none-any".to_string()
+    };
+    let wheel = format!(
+        "Wheel-Version: 1.0\nGenerator: wheelfs {}\nRoot-Is-Purelib: {}\nTag: {tag}\n",
+        env!("CARGO_PKG_VERSION"),
+        !compiled
+    );
+
+    if let Some(ep) = take(payload, "entry_points.txt") {
+        payload.files.insert(format!("{distinfo}/entry_points.txt"), ep);
+    }
+    // Remaining egg bookkeeping (SOURCES.txt, top_level.txt, zip-safe,
+    // dependency_links.txt, installed-files.txt) has no dist-info role.
+    let leftovers: Vec<String> = payload
+        .files
+        .keys()
+        .filter(|p| p.starts_with(&format!("{egg_dir}/")))
+        .cloned()
+        .collect();
+    for p in leftovers {
+        payload.files.remove(&p);
+    }
+    payload.files.insert(format!("{distinfo}/METADATA"), (0o644, metadata.into_bytes()));
+    payload.files.insert(format!("{distinfo}/WHEEL"), (0o644, wheel.into_bytes()));
+    Ok(())
 }
 
 /// Rewrite WHEEL's Tag lines, replacing the platform component with ours.
@@ -272,10 +399,16 @@ fn restamp_wheel(content: &str, platform_tag: &str) -> Result<(String, String)> 
 }
 
 fn convert(pkg: &Path, outdir: &Path, platform_tag: &str, keep_pyc: bool) -> Result<(PkgInfo, PathBuf)> {
-    let (info, payload) = read_pkg(pkg, keep_pyc)?;
+    let (info, mut payload) = read_pkg(pkg, keep_pyc)?;
     if payload.files.is_empty() {
         bail!("{}: no site-packages payload found; not a python pkg?", pkg.display());
     }
+    if !payload.files.keys().any(|p| {
+        p.split_once('/').is_some_and(|(d, _)| d.ends_with(".dist-info"))
+    }) {
+        egg_info_to_dist_info(&mut payload)?;
+    }
+    let payload = payload;
 
     // Locate exactly one dist-info directory.
     let mut distinfos: Vec<String> = payload
@@ -378,8 +511,11 @@ fn find_pkg_file(pkgname: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
         for e in rd.flatten() {
             let fname = e.file_name().to_string_lossy().into_owned();
             let Some(rest) = fname.strip_prefix(&prefix) else { continue };
-            let Some(ver) = rest.strip_suffix(".pkg") else { continue };
-            if ver.contains('~') || !ver.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+            let Some(verfull) = rest.strip_suffix(".pkg") else { continue };
+            // "2.4.6_1,1~cae94441f8" (local duplicate) and "2.4.6_1,1~2$hash"
+            // (hashed repo layout) both name the version before the '~'.
+            let ver = verfull.split('~').next().unwrap_or("");
+            if !ver.chars().next().is_some_and(|c| c.is_ascii_digit()) {
                 continue;
             }
             if best.as_ref().is_none_or(|(b, _)| ver > b.as_str()) {
@@ -402,8 +538,9 @@ fn materialize(
     let pyprefix = format!("py{}", python.replace('.', ""));
     let fetch_dir = dirs_cache_dir()?;
     let mut search_dirs: Vec<PathBuf> = pkg_dirs.to_vec();
-    // pkg fetch -o writes into <dir>/All
+    // pkg fetch -o writes into <dir>/All; hashed-layout repos use All/Hashed
     search_dirs.push(fetch_dir.join("All"));
+    search_dirs.push(fetch_dir.join("All/Hashed"));
 
     let mut queue: VecDeque<String> =
         packages.iter().map(|p| resolve_pkg_name(p, &pyprefix)).collect();
@@ -411,6 +548,7 @@ fn materialize(
     let mut wheels: Vec<PathBuf> = Vec::new();
     let mut native: BTreeMap<String, String> = BTreeMap::new();
     let mut missing: Vec<String> = Vec::new();
+    let mut failed: Vec<String> = Vec::new();
 
     while let Some(pkgname) = queue.pop_front() {
         if !visited.insert(pkgname.clone()) {
@@ -434,8 +572,13 @@ fn materialize(
             missing.push(pkgname);
             continue;
         };
-        let (info, wheel) = convert(&file, outdir, platform_tag, keep_pyc)
-            .with_context(|| format!("convert {}", file.display()))?;
+        let (info, wheel) = match convert(&file, outdir, platform_tag, keep_pyc) {
+            Ok(v) => v,
+            Err(e) => {
+                failed.push(format!("{pkgname}: {e:#}"));
+                continue;
+            }
+        };
         println!("{pkgname} -> {}", wheel.file_name().unwrap_or_default().to_string_lossy());
         wheels.push(wheel);
         for (dep, ver) in info.deps {
@@ -463,7 +606,12 @@ fn materialize(
     if !missing.is_empty() {
         println!("no .pkg found for: {}", missing.join(", "));
         println!("  (fetch with: doas pkg fetch -y {})", missing.join(" "));
-        bail!("{} pkg(s) could not be materialized", missing.len());
+    }
+    for f in &failed {
+        println!("conversion failed: {f}");
+    }
+    if !missing.is_empty() || !failed.is_empty() {
+        bail!("{} pkg(s) could not be materialized", missing.len() + failed.len());
     }
     Ok(())
 }
