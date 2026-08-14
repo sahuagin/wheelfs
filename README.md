@@ -65,6 +65,21 @@ scikit-learn/statsmodels/xgboost/lightgbm + their 56-pkg closure):
   (PyPI wheels bundle), so the corresponding library pkgs must be installed
   (e.g. `brotli` for `py312-brotli`). pkg's dependency graph expresses this;
   wheels cannot. The FUSE layer will eventually surface it.
+- **Native deps are reported, never auto-installed — by design.** Installing
+  is `pkg install`'s job: it enforces the `pkg audit`/vuxml gate (a CVE'd
+  package refuses to install without an explicit override), and in poudriere
+  workflows the right move is adding the dependency to the build list and
+  rebuilding, not ad-hoc installs from official pkgs. An opt-in
+  `--install-deps` may come for dedicated single-purpose jails; it will
+  never be the default. Corollary on the roadmap: conversion itself
+  side-steps the audit gate (uv knows nothing of vuxml), so materialize
+  should eventually run the vuxml check against what it converts and
+  refuse vulnerable versions without `--force`.
+- **Non-default python flavors come from poudriere.** Official repos build
+  only the default python (py312 today); `--python 3.14` is meaningful
+  pointed at a poudriere repo that did a 3.14 bulk. That repo is just
+  another pkg repo with higher `PRIORITY` — wheelfs inherits it through
+  the same lookup path with no special-casing.
 - **Versions are whatever your pkg repos carry.** wheelfs solves
   distribution, not version pinning. For pinned/custom builds, put a
   poudriere repo in `/usr/local/etc/pkg/repos/` with higher `PRIORITY` —
